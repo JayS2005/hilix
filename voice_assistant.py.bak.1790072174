@@ -1,0 +1,692 @@
+"""Push-to-talk local voice client.
+
+STT: faster-whisper (local)
+HELIX: http://127.0.0.1:8000/agent
+TTS: ElevenLabs
+"""
+import os, io, subprocess, requests
+import webbrowser
+import difflib
+import re
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+from dotenv import load_dotenv
+from faster_whisper import WhisperModel
+
+load_dotenv()
+API_URL = "http://127.0.0.1:8000/agent"
+TOKEN = os.environ.get("HELIX_API_TOKEN", "")
+PIPER_URL = os.environ.get("PIPER_URL", "http://127.0.0.1:5000")
+MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
+SAMPLE_RATE = 16000
+
+model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+
+# --- Whitelisted local app launcher (Windows side, no round trip to agent) ---
+WINDOWS_APP_WHITELIST = {
+    "utorrent": "utorrent",
+    "brave": "brave",
+    "cherrytree": "cherrytree",
+    "packet tracer": "PacketTracer",
+    "copilot": "msedge --app=https://copilot.microsoft.com",
+    "cyberghost": "CyberGhost",
+    "easeus": "EaseUS Data Recovery Wizard",
+    "eset": "ESET Security",
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "ip messenger": "ipmsg",
+    "iperius remote": "IperiusRemote",
+    "edge": "msedge",
+    "microsoft edge": "msedge",
+    "word": "winword",
+    "excel": "excel",
+    "powerpoint": "powerpnt",
+    "outlook": "outlook",
+    "onedrive": "onedrive",
+    "onenote": "onenote",
+    "vscode": "code",
+    "visual studio code": "code",
+    "geforce experience": "NVIDIA GeForce Experience",
+    "obsidian": "obsidian",
+    "peazip": "peazip",
+    "proton vpn": "ProtonVPN",
+    "push wallpaper": "PUSHVideoWallpaper",
+    "remote desktop": "mstsc",
+    "screenrec": "ScreenRec",
+    "signal": "signal",
+    "telegram": "Telegram",
+    "terabox": "TeraBox",
+    "ultraviewer": "UltraViewer",
+    "vlc": "vlc",
+    "vmware": "vmware",
+    "voicemod": "voicemod",
+    "windirstat": "windirstat",
+    "wiztree": "wiztree",
+    "xampp": "xampp-control",
+    "zoho mail": "Zoho Mail",
+    "zoom": "Zoom",
+    "cherry tree": "cherrytree",
+    "files": "explorer",
+    "file manager": "explorer",
+    "whatsapp": "start whatsapp:",
+    "notepad": "notepad",
+    "calculator": "calc",
+    "explorer": "explorer",
+}
+
+import ctypes
+import time
+
+def open_start_menu():
+    VK_LWIN = 0x5B
+    ctypes.windll.user32.keybd_event(VK_LWIN, 0, 0, 0)
+    time.sleep(0.05)
+    ctypes.windll.user32.keybd_event(VK_LWIN, 0, 2, 0)  # key up
+    print("Opened Start menu")
+
+SCHEDULED_ACTIONS = {
+    "antivirus scan": r'"C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 1',
+    "quick scan": r'"C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 1',
+    "full scan": r'"C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 2',
+}
+
+def _parse_time(text_lower):
+    m = re.search(r"\b(\d{1,2})(:(\d{2}))?\s*(am|pm)?\b", text_lower)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(3)) if m.group(3) else 0
+    ampm = m.group(4)
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    return "%02d:%02d" % (hour, minute)
+
+def try_schedule_task(text_lower):
+    if not ("wake" in text_lower or "get up" in text_lower or "sleep and" in text_lower or "schedule" in text_lower):
+        return False
+    if "run" not in text_lower:
+        return False
+
+    time_str = _parse_time(text_lower)
+    if not time_str:
+        print("Could not understand the time. Try: wake me at 2am and run antivirus scan")
+        return True
+
+    action_key = None
+    for key in SCHEDULED_ACTIONS:
+        if key in text_lower:
+            action_key = key
+            break
+    if not action_key:
+        print("Could not match a known scheduled action. Available: " + str(list(SCHEDULED_ACTIONS)))
+        return True
+
+    command = SCHEDULED_ACTIONS[action_key]
+    task_name = "Helix_" + action_key.replace(" ", "_")
+
+    ps_lines = [
+        '$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument \'-WindowStyle Hidden -Command \"' + command + '\"\'',
+        "$trigger = New-ScheduledTaskTrigger -Daily -At " + time_str,
+        "$settings = New-ScheduledTaskSettingsSet -WakeToRun",
+        'Register-ScheduledTask -TaskName "' + task_name + '" -Action $action -Trigger $trigger -Settings $settings -Force',
+    ]
+    ps_script = "; ".join(ps_lines)
+    try:
+        subprocess.run(["powershell.exe", "-Command", ps_script], check=True, capture_output=True, text=True)
+        print("Scheduled: wake at " + time_str + " daily and run " + action_key)
+    except subprocess.CalledProcessError as e:
+        print("Failed to schedule task: " + str(e.stderr))
+    return True
+
+
+
+import os as _os_sd
+
+HELIX_DOWNLOAD_DIR = _os_sd.path.join(_os_sd.path.expanduser("~"), "HelixDownloads")
+_os_sd.makedirs(HELIX_DOWNLOAD_DIR, exist_ok=True)
+
+_pending_search_results = []
+
+def search_web(query):
+    """Search via DuckDuckGo HTML endpoint (no API key needed). Returns list of (title, url)."""
+    try:
+        r = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        print("Search failed: " + str(e))
+        return []
+
+    results = re.findall(r'result__a" href="([^"]+)"[^>]*>(.*?)</a>', r.text)
+    cleaned = []
+    for url, title in results[:3]:
+        title_clean = re.sub("<[^>]+>", "", title)
+        cleaned.append((title_clean, url))
+    return cleaned
+
+
+def download_and_scan(url, suggested_name):
+    dest = _os_sd.path.join(HELIX_DOWNLOAD_DIR, suggested_name)
+    try:
+        r = requests.get(url, stream=True, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "")
+        if "text/html" in content_type:
+            print("That link points to a webpage, not a direct file. I will not save a webpage as if it were the tool.")
+            print("Link for you to check manually: " + url)
+            return
+        size = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                size += len(chunk)
+                if size > 50 * 1024 * 1024:
+                    f.close()
+                    _os_sd.remove(dest)
+                    print("Download exceeded 50MB limit, aborted.")
+                    return
+                f.write(chunk)
+        print("Downloaded to " + dest + ". Scanning with Windows Defender now...")
+        scan_cmd = [
+            r"C:\Program Files\Windows Defender\MpCmdRun.exe",
+            "-Scan", "-ScanType", "3", "-File", dest,
+        ]
+        try:
+            result = subprocess.run(scan_cmd, capture_output=True, text=True, timeout=120)
+            print("Scan result: " + result.stdout.strip()[-500:])
+        except Exception as e:
+            print("Could not run antivirus scan: " + str(e))
+    except Exception as e:
+        print("Download failed: " + str(e))
+
+
+MEDIA_KEYWORDS = ["song", "music", "video", "mp3", "mp4", "movie", "album", "track", "lyrics"]
+
+def try_search_or_select(text_lower):
+    global _pending_search_results
+
+    if _pending_search_results:
+        if "cancel" in text_lower or "never mind" in text_lower:
+            _pending_search_results = []
+            print("Cancelled.")
+            return True
+        choice = None
+        if "first" in text_lower or " one" in text_lower or "1" in text_lower:
+            choice = 0
+        elif "second" in text_lower or "two" in text_lower or "2" in text_lower:
+            choice = 1
+        elif "third" in text_lower or "three" in text_lower or "3" in text_lower:
+            choice = 2
+        if choice is not None and choice < len(_pending_search_results):
+            title, url = _pending_search_results[choice]
+            is_media = any(k in title.lower() or k in url.lower() for k in MEDIA_KEYWORDS)
+            _pending_search_results = []
+            if is_media:
+                print("That looks like a song/video link. I will not auto-download media - open it yourself here: " + url)
+                return True
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", title)[:60] or "download"
+            download_and_scan(url, safe_name)
+            return True
+
+    if "find" in text_lower or "search for" in text_lower or ("download" in text_lower and "http" not in text_lower):
+        query = text_lower
+        for trigger in ["helix", "find", "search for", "download"]:
+            query = query.replace(trigger, "")
+        query = query.strip()
+        if not query:
+            return False
+        print("Searching for: " + query)
+        results = search_web(query)
+        if not results:
+            print("No results found.")
+            return True
+        _pending_search_results = results
+        for i, (title, url) in enumerate(results):
+            print(str(i + 1) + ". " + title + " - " + url)
+        print("Say 'first', 'second', 'third', or 'cancel'.")
+        return True
+
+    return False
+
+
+def handle_os_command(text_lower: str) -> bool:
+    if "lock" in text_lower and ("screen" in text_lower or "computer" in text_lower or "workstation" in text_lower or text_lower.strip().endswith("lock")):
+        subprocess.Popen("rundll32.exe user32.dll,LockWorkStation", shell=True)
+        print("Locking workstation.")
+        return True
+
+    if "sleep" in text_lower and "and" not in text_lower:
+        subprocess.Popen("rundll32.exe powrprof.dll,SetSuspendState 0,1,0", shell=True)
+        print("Putting computer to sleep.")
+        return True
+
+    if "task scheduler" in text_lower:
+        subprocess.Popen("taskschd.msc", shell=True)
+        print("Opening Task Scheduler.")
+        return True
+
+    if "confirm shutdown" in text_lower:
+        subprocess.Popen("shutdown /s /t 5", shell=True)
+        print("Shutting down in 5 seconds. Run shutdown /a to cancel.")
+        return True
+    if "shutdown" in text_lower:
+        print("Shutdown requires confirmation. Say: Helix confirm shutdown.")
+        return True
+
+    if "confirm restart" in text_lower:
+        subprocess.Popen("shutdown /r /t 5", shell=True)
+        print("Restarting in 5 seconds. Run shutdown /a to cancel.")
+        return True
+    if "restart" in text_lower:
+        print("Restart requires confirmation. Say: Helix confirm restart.")
+        return True
+
+    if "confirm log off" in text_lower or "confirm logoff" in text_lower or "confirm sign out" in text_lower:
+        subprocess.Popen("shutdown /l", shell=True)
+        print("Logging off.")
+        return True
+    if "log off" in text_lower or "logoff" in text_lower or "sign out" in text_lower:
+        print("Log off requires confirmation. Say: Helix confirm log off.")
+        return True
+
+    return False
+
+
+def try_open_app(text_lower: str) -> bool:
+    # 1. exact substring match first
+    for name, cmd in WINDOWS_APP_WHITELIST.items():
+        if name in text_lower:
+            try:
+                subprocess.Popen(cmd, shell=True)
+                print(f"Launching: {name}")
+            except Exception as e:
+                print(f"Failed to launch {name}: {e}")
+            return True
+
+    # 2. fuzzy fallback: compare each word/phrase after "open" against whitelist keys
+    words_after_open = text_lower.split("open", 1)[-1].strip()
+    if not words_after_open:
+        return False
+    candidates = list(WINDOWS_APP_WHITELIST.keys())
+    match = difflib.get_close_matches(words_after_open, candidates, n=1, cutoff=0.6)
+    if match:
+        name = match[0]
+        cmd = WINDOWS_APP_WHITELIST[name]
+        try:
+            subprocess.Popen(cmd, shell=True)
+            print(f"Launching (fuzzy match '{words_after_open}' -> '{name}'): {name}")
+        except Exception as e:
+            print(f"Failed to launch {name}: {e}")
+        return True
+    return False
+
+
+def record(seconds=4):
+    print("Tuning...")
+    audio = sd.rec(int(seconds * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype="float32")
+    sd.wait()
+    path = "voice_input.wav"
+    sf.write(path, audio, SAMPLE_RATE)
+    return path
+
+
+def transcribe(path):
+    segments, _ = model.transcribe(path, beam_size=5, language="en")
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+def ask(text):
+    r = requests.post(API_URL, headers={"Authorization": f"Bearer {TOKEN}"}, json={"message": text}, timeout=120)
+    r.raise_for_status()
+    return r.json().get("answer", "")
+
+
+ELEVEN_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVEN_VOICE_DEFAULT = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+ELEVEN_VOICE_EVIL = os.environ.get("ELEVENLABS_VOICE_ID_EVIL", "cxBcSUO2wRQX14onLPZI")
+current_voice = [ELEVEN_VOICE_DEFAULT]
+
+
+def speak(text):
+    r = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{current_voice[0]}",
+        headers={"xi-api-key": ELEVEN_KEY, "Content-Type": "application/json"},
+        json={"text": text, "model_id": "eleven_multilingual_v2",
+              "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
+        timeout=60,
+    )
+    r.raise_for_status()
+    data, sr = sf.read(io.BytesIO(r.content), dtype="float32")
+    sd.play(data, sr)
+    sd.wait()
+
+
+import difflib as _difflib_voice
+
+def _fuzzy_voice_switch(text_lower):
+    stripped = text_lower.replace("helix", "").strip()
+    evil_ratio = _difflib_voice.SequenceMatcher(None, stripped, "evil assistant").ratio()
+    normal_ratio = _difflib_voice.SequenceMatcher(None, stripped, "normal assistant").ratio()
+    if evil_ratio >= 0.55 and evil_ratio >= normal_ratio:
+        return "evil"
+    if normal_ratio >= 0.55 and normal_ratio > evil_ratio:
+        return "normal"
+    return None
+
+
+
+def launch_dashboard():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    stats_script = os.path.join(base_dir, "stats_server.py")
+    dashboard_html = os.path.join(base_dir, "helix_dashboard.html")
+
+    if os.path.exists(stats_script):
+        try:
+            subprocess.Popen(
+                ["python", stats_script],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                cwd=base_dir,
+            )
+            print("Stats server starting...")
+        except Exception as e:
+            print("Could not start stats server: " + str(e))
+    else:
+        print("stats_server.py not found next to voice_assistant.py, skipping.")
+
+    if os.path.exists(dashboard_html):
+        try:
+            webbrowser.open("file:///" + dashboard_html.replace("\\", "/"))
+            print("Opening dashboard...")
+        except Exception as e:
+            print("Could not open dashboard: " + str(e))
+    else:
+        print("helix_dashboard.html not found next to voice_assistant.py, skipping.")
+
+
+if __name__ == "__main__":
+    print("HELIX voice client. Ctrl+C to stop.")
+    launch_dashboard()
+    while True:
+        path = record()
+        text = transcribe(path)
+        if text:
+            text = "Helix " + text
+        print("You:", text)
+        if not text:
+            continue
+        _vswitch = _fuzzy_voice_switch(text.lower())
+        if _vswitch == "evil":
+            current_voice[0] = ELEVEN_VOICE_EVIL
+            print("Voice switched: EVIL")
+            continue
+        if _vswitch == "normal":
+            current_voice[0] = ELEVEN_VOICE_DEFAULT
+            print("Voice switched: DEFAULT")
+            continue
+        if "start menu" in text.lower():
+            open_start_menu()
+            continue
+        if try_schedule_task(text.lower()):
+            continue
+        if try_search_or_select(text.lower()):
+            continue
+        if handle_os_command(text.lower()):
+            continue
+        if "open" in text.lower() and try_open_app(text.lower()):
+            continue
+        answer = ask(text)
+        print("HELIX:", answer)
+        if answer:
+            speak(answer)
+
+# === MUTE FEATURE ===
+import threading as _mute_threading
+import requests as _mute_requests
+
+_mute_state = {"muted": False}
+_mute_lock = _mute_threading.Lock()
+
+def _mute_get_base_url():
+    # Reuse whatever base URL / token the rest of this client already uses.
+    try:
+        return API_BASE_URL  # noqa: F821  (expected to exist elsewhere in this file)
+    except NameError:
+        return "http://127.0.0.1:8000"
+
+def _mute_get_token():
+    try:
+        return HELIX_API_TOKEN  # noqa: F821
+    except NameError:
+        import os
+        return os.environ.get("HELIX_API_TOKEN", "")
+
+def is_muted():
+    with _mute_lock:
+        return _mute_state["muted"]
+
+def _mute_poll_loop():
+    base = _mute_get_base_url()
+    while True:
+        try:
+            r = _mute_requests.get(f"{base}/mute/status", timeout=2)
+            if r.ok:
+                new_val = bool(r.json().get("muted", False))
+                with _mute_lock:
+                    was_muted = _mute_state["muted"]
+                    _mute_state["muted"] = new_val
+                if new_val and not was_muted:
+                    _mute_stop_playback()
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+def _mute_stop_playback():
+    # NOTE: this assumes TTS audio is played with pygame.mixer.music.
+    # If this client plays audio a different way (playsound, winsound, simpleaudio,
+    # etc.), replace the body of this function with that library's stop call.
+    try:
+        import pygame
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+    except Exception:
+        pass
+
+def set_mute(muted: bool):
+    base = _mute_get_base_url()
+    token = _mute_get_token()
+    endpoint = "/mute/on" if muted else "/mute/off"
+    try:
+        _mute_requests.post(
+            f"{base}{endpoint}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=3,
+        )
+    except Exception:
+        pass
+    with _mute_lock:
+        _mute_state["muted"] = muted
+    if muted:
+        _mute_stop_playback()
+
+def handle_mute_voice_command(text: str) -> bool:
+    """Call this early in your command-handling flow, before sending text to the
+    LLM. Returns True if the text was a mute/unmute command (and was handled),
+    False otherwise -- so you know whether to continue normal processing."""
+    normalized = text.strip().lower()
+    if normalized in ("mute yourself", "mute"):
+        set_mute(True)
+        print("[Helix] Muted.")
+        return True
+    if normalized in ("unmute yourself", "unmute"):
+        set_mute(False)
+        print("[Helix] Unmuted.")
+        return True
+    return False
+
+_mute_poll_thread = _mute_threading.Thread(target=_mute_poll_loop, daemon=True)
+_mute_poll_thread.start()
+# === END MUTE FEATURE ===
+
+# === CLOSE APP FEATURE ===
+import difflib as _close_difflib
+import subprocess as _close_subprocess
+import ctypes as _close_ctypes
+
+# Only these apps can be closed by voice. Add to this list deliberately --
+# do not make it "close anything"; that turns a voice interface into a
+# generic process-killer.
+CLOSE_APP_WHITELIST = {
+    "utorrent": ["uTorrent.exe"],
+    "brave": ["brave.exe"],
+    "cherrytree": ["cherrytree.exe"],
+    "chrome": ["chrome.exe"],
+    "edge": ["msedge.exe"],
+    "word": ["WINWORD.EXE"],
+    "excel": ["EXCEL.EXE"],
+    "powerpoint": ["POWERPNT.EXE"],
+    "outlook": ["OUTLOOK.EXE"],
+    "onedrive": ["OneDrive.exe"],
+    "onenote": ["ONENOTE.EXE"],
+    "vscode": ["Code.exe"],
+    "obsidian": ["Obsidian.exe"],
+    "vlc": ["vlc.exe"],
+    "telegram": ["Telegram.exe"],
+    "signal": ["Signal.exe"],
+    "zoom": ["Zoom.exe"],
+    "whatsapp": ["WhatsApp.exe"],
+    "notepad": ["notepad.exe"],
+    "calc": ["CalculatorApp.exe", "calc.exe"],
+}
+
+_FILE_MANAGER_ALIASES = ["file manager", "explorer", "files", "file explorer"]
+
+def _close_file_explorer_windows():
+    """Closes open File Explorer windows without touching the explorer.exe
+    shell process itself (killing that process would also kill your taskbar
+    and desktop icons)."""
+    WM_CLOSE = 0x0010
+    user32 = _close_ctypes.windll.user32
+
+    def enum_handler(hwnd, lparam):
+        buf = _close_ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value == "CabinetWClass":  # File Explorer window class
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        return True
+
+    EnumWindowsProc = _close_ctypes.WINFUNCTYPE(_close_ctypes.c_bool, _close_ctypes.c_int, _close_ctypes.c_int)
+    user32.EnumWindows(EnumWindowsProc(enum_handler), 0)
+
+def handle_close_app_command(text: str) -> bool:
+    """Call this alongside your existing open-app handler, before sending
+    text to the LLM. Returns True if it was a recognized close command
+    (and was handled), False otherwise -- so you know whether to continue
+    normal processing (including possibly falling through to the LLM)."""
+    t = text.strip().lower()
+    prefixes = ["close ", "quit ", "exit ", "kill "]
+    prefix = next((p for p in prefixes if t.startswith(p)), None)
+    if not prefix:
+        return False
+    target = t[len(prefix):].strip()
+    if not target:
+        return False
+
+    if target in _FILE_MANAGER_ALIASES or _close_difflib.get_close_matches(target, _FILE_MANAGER_ALIASES, n=1, cutoff=0.55):
+        _close_file_explorer_windows()
+        print("[Helix] Closed File Explorer window(s).")
+        return True
+
+    keys = list(CLOSE_APP_WHITELIST.keys())
+    match = _close_difflib.get_close_matches(target, keys, n=1, cutoff=0.55)
+    if not match:
+        return False  # not a recognized app -- let normal handling continue
+    app_key = match[0]
+    for proc in CLOSE_APP_WHITELIST[app_key]:
+        _close_subprocess.run(["taskkill", "/IM", proc, "/F"], capture_output=True)
+    print(f"[Helix] Closed {app_key}.")
+    return True
+# === END CLOSE APP FEATURE ===
+
+# === DESTROY COMMAND FEATURE ===
+import ctypes as _destroy_ctypes
+import subprocess as _destroy_subprocess
+import time as _destroy_time
+
+_destroy_pending = {"armed": False, "armed_at": 0.0}
+_DESTROY_CONFIRM_WINDOW_SECONDS = 15  # confirmation must follow within this window
+
+# Window classes to leave alone -- these are shell/system chrome, not user apps.
+_DESTROY_SKIP_CLASSES = {
+    "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+    "Windows.UI.Core.CoreWindow", "ApplicationFrameWindow", "TaskListThumbnailWnd",
+}
+
+def _destroy_close_all_windows():
+    """Best-effort graceful close of visible top-level app windows, same as
+    clicking the X on each -- unsaved-work prompts still appear. Does not
+    force-kill anything."""
+    user32 = _destroy_ctypes.windll.user32
+    WM_CLOSE = 0x0010
+
+    def enum_handler(hwnd, lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        buf = _destroy_ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value in _DESTROY_SKIP_CLASSES:
+            return True
+        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        return True
+
+    EnumWindowsProc = _destroy_ctypes.WINFUNCTYPE(_destroy_ctypes.c_bool, _destroy_ctypes.c_int, _destroy_ctypes.c_int)
+    user32.EnumWindows(EnumWindowsProc(enum_handler), 0)
+
+def _destroy_execute():
+    print("[Helix] Destroy confirmed. Closing open applications...")
+    _destroy_close_all_windows()
+    _destroy_time.sleep(5)  # give apps a moment to close / show save prompts
+    print("[Helix] Shutting down.")
+    # Plain (non-forced) shutdown: Windows will still prompt for anything that
+    # didn't close cleanly above, rather than silently discarding work.
+    _destroy_subprocess.run(["shutdown", "/s", "/t", "0"], capture_output=True)
+
+def handle_destroy_command(text: str) -> bool:
+    """Call this alongside your other command handlers, before sending text
+    to the LLM. Returns True if the text was consumed by the destroy flow
+    (armed or executed), False otherwise."""
+    t = text.strip().lower()
+
+    if _destroy_pending["armed"]:
+        elapsed = _destroy_time.time() - _destroy_pending["armed_at"]
+        if elapsed > _DESTROY_CONFIRM_WINDOW_SECONDS:
+            _destroy_pending["armed"] = False  # window expired, fall through
+        elif t in ("confirm destroy", "confirm"):
+            _destroy_pending["armed"] = False
+            _destroy_execute()
+            return True
+        else:
+            _destroy_pending["armed"] = False  # anything else cancels it
+            print("[Helix] Destroy cancelled.")
+            return True
+
+    if t == "destroy":
+        _destroy_pending["armed"] = True
+        _destroy_pending["armed_at"] = _destroy_time.time()
+        print("[Helix] This will close all open applications and shut down the "
+              "computer. Say 'confirm destroy' within 15 seconds to proceed, "
+              "or anything else to cancel.")
+        return True
+
+    return False
+# === END DESTROY COMMAND FEATURE ===
